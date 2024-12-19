@@ -1,0 +1,14 @@
+master:
+  host: "192.168.1.1"
+  username: "admin"
+  password: "password123"  # Optional if using SSH keys
+  key_file: "/app/config/ssh_keys/id_rsa"  # Path to the SSH key file inside the container
+slaves:
+  - host: "192.168.1.2"
+    username: "admin"
+    password: "password123"
+    key_file: "/app/config/ssh_keys/id_rsa"
+  - host: "192.168.1.3"
+    username: "admin"
+    password: "password123"
+    key_file: "/app/config/ssh_keys/id_rsa"
