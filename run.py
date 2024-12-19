@@ -72,7 +72,7 @@ def get_dhcp_reservations(client, command='/ip dhcp-server export terse'):
             attributes = parse_attributes(raw)
             if 'address' in attributes:
                 # handle special case no server means all
-                server = attributes.get('server', "all")
+                server = attributes.get('server', '')
                 address = attributes['address']
                 if server not in reservations:
                     reservations[server] = {}
@@ -96,27 +96,48 @@ def parse_attributes(line):
 def sync_reservations(master_reservations, slave_host, client):
     slave_reservations = get_dhcp_reservations(client)
 
-    logger.debug("Reservations for {slave_host}:\n%s", json.dumps(slave_reservations, indent=4))
+    logger.debug(f"Reservations for {slave_host}:\n{json.dumps(slave_reservations, indent=4)}")
 
     for server, master_server_reservations in master_reservations.items():
-        if server in slave_reservations:
-            slave_server_reservations = slave_reservations[server]
+        if server in slave_reservations or server == "":
+            slave_server_reservations = slave_reservations[server] if server in slave_reservations else {}
+
+            match_server = '' if server == '' else 'server="{server}"'
 
             for ip, master_res in master_server_reservations.items():
+                master_mac = master_res["attributes"]["mac-address"]
+
+                conflict_ip = next(
+                    (slave_ip for slave_ip, slave_res in slave_server_reservations.items()
+                     if slave_res["attributes"]["mac-address"] == master_mac),
+                    None
+                )
+
                 if ip not in slave_server_reservations:
+                    if conflict_ip:
+                        logger.warning(
+                            f"Conflict found for MAC {master_mac} on {slave_host}: "
+                            f"slave has IP {conflict_ip}, master has IP {ip}. Removing conflicting reservation."
+                        )
+                        remove_command = f'/ip dhcp-server lease remove [find {match_server} mac-address={master_mac}]'
+                        ssh_command(client, remove_command)
                     logger.info(f"Adding reservation on {slave_host} for server {server} and IP {ip}: {master_res['raw']}")
-                    command = f'/ip dhcp-server lease add ' + master_res["raw"]
-                    ssh_command(client, command)
+                    add_command = f'/ip dhcp-server lease add ' + master_res["raw"]
+                    ssh_command(client, add_command)
                 else:
-                    # can´t do a full check on decoded attributes because checkbox attribute parsing is not implemented
                     if master_res["raw"] != slave_server_reservations[ip]["raw"]:
-                        server = master_res["attributes"]["server"]
-                        # updating will not work here since attributes like block-access=yes will not be restored to default
+                        if conflict_ip:
+                            logger.warning(
+                                f"Conflict found for MAC {master_mac} on {slave_host}: "
+                                f"slave has IP {conflict_ip}, master has IP {ip}. Removing conflicting reservation."
+                            )
+                            remove_command = f'/ip dhcp-server lease remove [find {match_server} mac-address={master_mac}]'
+                            ssh_command(client, remove_command)
                         logger.info(f"Replacing reservation on {slave_host} for server {server} and IP {ip}: {master_res['raw']}")
-                        command = f'/ip dhcp-server lease remove [find server={server} address={ip}]'
-                        ssh_command(client, command)
-                        command = f'/ip dhcp-server lease add ' + master_res["raw"]
-                        ssh_command(client, command)
+                        remove_command = f'/ip dhcp-server lease remove [find {match_server} address={ip}]'
+                        ssh_command(client, remove_command)
+                        add_command = f'/ip dhcp-server lease add ' + master_res["raw"]
+                        ssh_command(client, add_command)
         else:
             logger.debug(f"Server {server} not found on {slave_host}. Skipping synchronization.")
 
