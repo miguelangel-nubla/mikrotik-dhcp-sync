@@ -102,7 +102,7 @@ def sync_reservations(master_reservations, slave_host, client):
         if server in slave_reservations or server == "":
             slave_server_reservations = slave_reservations[server] if server in slave_reservations else {}
 
-            match_server = '' if server == '' else 'server="{server}"'
+            match_server = '' if server == '' else f'server="{server}"'
 
             for ip, master_res in master_server_reservations.items():
                 master_mac = master_res["attributes"]["mac-address"]
