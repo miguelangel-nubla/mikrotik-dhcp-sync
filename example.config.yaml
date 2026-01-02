@@ -12,3 +12,6 @@ slaves:
     username: "admin"
     password: "password123"
     key_file: "/app/config/ssh_keys/id_rsa"
+watchyourlan:
+  - url: "http://your-watchyourlan-instance-1:8840"
+  - url: "http://your-watchyourlan-instance-2:8840"

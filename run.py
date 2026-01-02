@@ -5,6 +5,8 @@ import json
 import os
 import logging
 import sys
+import requests
+import urllib.parse
 
 config_dir = os.environ.get("CONFIG_DIR", "./")
 
@@ -146,6 +148,99 @@ def sync_reservations(master_reservations, slave_host, client):
 
             missing_servers[slave_host].append(server)
 
+def sync_watchyourlan(master_reservations, wyl_config):
+    wyl_url = wyl_config.get('url')
+    if not wyl_url:
+        logger.warning("WatchYourLAN URL not configured, skipping.")
+        return
+
+    logger.info(f"Syncing to WatchYourLAN at {wyl_url}...")
+
+    try:
+        # Fetch all hosts from WatchYourLAN
+        response = requests.get(f"{wyl_url}/api/all")
+        response.raise_for_status()
+        wyl_hosts = response.json()
+    except Exception as e:
+        logger.error(f"Failed to fetch hosts from WatchYourLAN: {e}")
+        return
+
+    # Map MAC to Wyl Host
+    # Normalize MACs to lowercase
+    wyl_hosts_by_mac = {h['Mac'].lower(): h for h in wyl_hosts if 'Mac' in h}
+    
+    # Collect all master MACs
+    master_macs = set()
+    
+    # Iterate through master reservations to update WYL
+    for server, server_reservations in master_reservations.items():
+        for ip, res in server_reservations.items():
+            mac = res["attributes"].get("mac-address")
+            if not mac:
+                continue
+            
+            mac = mac.lower()
+            master_macs.add(mac)
+            
+            if mac in wyl_hosts_by_mac:
+                wyl_host = wyl_hosts_by_mac[mac]
+                wyl_id = wyl_host['ID']
+                
+                # Get comment/name from Mikrotik
+                name = res["attributes"].get("comment", "")
+                
+                current_known = wyl_host.get('Known', False)
+                current_name = wyl_host.get('Name', '')
+
+                # Logic: 
+                # 1. Update name if different (using URL without /toggle)
+                # 2. Toggle 'known' if state is wrong (using URL with /toggle)
+                
+                enc_name = urllib.parse.quote(name) if name else ""
+                if not enc_name:
+                     enc_name = "-"
+
+                try:
+                    # Step 1: Update Name if needed
+                    if current_name != name:
+                        # Call WITHOUT /toggle to just update name/id
+                        update_url = f"{wyl_url}/api/edit/{wyl_id}/{enc_name}" 
+                        requests.get(update_url)
+                        logger.debug(f"Updated WatchYourLAN host {mac} name to '{name}'")
+                    
+                    # Step 2: Ensure Known=True
+                    if not current_known:
+                        # Toggle to True
+                        toggle_url = f"{wyl_url}/api/edit/{wyl_id}/{enc_name}/toggle"
+                        requests.get(toggle_url)
+                        logger.info(f"Updated WatchYourLAN host {mac}: Set Known=True")
+                        
+                except Exception as e:
+                    logger.error(f"Failed to update WatchYourLAN host {mac}: {e}")
+
+    # Unmark known for hosts not in master
+    for wyl_host in wyl_hosts:
+        mac = wyl_host.get('Mac')
+        if mac:
+             mac = mac.lower()
+             
+        if mac and mac not in master_macs:
+            if wyl_host.get('Known'): # If currently known
+                try:
+                    wyl_id = wyl_host['ID']
+                    current_name = wyl_host.get('Name', 'Unknown')
+                    enc_name = urllib.parse.quote(current_name)
+                    if not enc_name:
+                        enc_name = "-"
+
+                    # Current=True. Target=False.
+                    # One call toggles to False.
+                    edit_url = f"{wyl_url}/api/edit/{wyl_id}/{enc_name}/toggle"
+                    requests.get(edit_url)
+                    logger.info(f"Unmarked known flag for WatchYourLAN host {mac} (not in master)")
+                except Exception as e:
+                    logger.error(f"Failed to unmark WatchYourLAN host {mac}: {e}")
+
 def main():
     config_file = os.path.join(config_dir, "config.yaml")
     config = load_config(config_file)
@@ -176,6 +271,17 @@ def main():
         for slave, servers in missing_servers.items():
             logger.warning(f"On slave {slave}, the following servers were missing: {', '.join(servers)}.")
         sys.exit(2)
+
+
+    if config.get('watchyourlan'):
+        wyl_configs = config.get('watchyourlan')
+        if isinstance(wyl_configs, list):
+            for wyl_config in wyl_configs:
+                sync_watchyourlan(master_reservations, wyl_config)
+        else:
+             # Support legacy single object if user provided (though plan said list, robustness good)
+             sync_watchyourlan(master_reservations, wyl_configs)
+
 
     logger.info("Reservation sync completed successfully.")
     sys.exit(0)
