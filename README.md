@@ -7,8 +7,9 @@ This script synchronizes DHCP reservations from a "Master" Mikrotik router to on
 -   **Mikrotik to Mikrotik Sync**:
     -   Reads DHCP leases from a master router.
     -   Syncs them to configured slave routers.
-    -   Handles conflicts (IP/MAC mismatches) by removing old leases on slaves.
+    -   Removes leases on slaves that the master doesn't have or that differ from it, including ones that conflict by MAC or by server.
     -   Adds new leases or updates existing ones on slaves.
+    -   Exits non-zero if any change is rejected by a slave.
 -   **WatchYourLAN Sync**:
     -   Updates host names in WatchYourLAN based on Mikrotik DHCP comments.
     -   Automatically marks hosts as "known" in WatchYourLAN if matched by MAC address.
@@ -43,4 +44,8 @@ docker run --rm \
 -   `LOG_LEVEL`: Set logging verbosity (default: `INFO`).
     ```bash
     -e LOG_LEVEL=DEBUG
+    ```
+-   `DRY_RUN`: Log the changes that would be made on slaves without making them.
+    ```bash
+    -e DRY_RUN=1
     ```

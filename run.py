@@ -14,7 +14,10 @@ log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
 logging.basicConfig(level=log_level, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
 
+dry_run = os.getenv('DRY_RUN', '').lower() in ('1', 'true', 'yes')
+
 missing_servers = {}
+failed_commands = []
 
 def handle_error(message, exit_code=1):
     logger.error(message)
@@ -59,6 +62,17 @@ def ssh_command(client, command):
     except Exception as e:
         handle_error(f"Error during SSH command execution: {e}")
 
+def ssh_change(client, host, command):
+    if dry_run:
+        logger.info(f"[dry-run] Would run on {host}: {command}")
+        return
+
+    output = ssh_command(client, command)
+    # RouterOS prints nothing when an add/remove succeeds, so any output is an error message
+    if output.strip():
+        logger.error(f"Command failed on {host}: {command}: {output.strip()}")
+        failed_commands.append((host, command))
+
 def get_dhcp_reservations(client, command='/ip dhcp-server export terse'):
     output = ssh_command(client, command)
     reservations = {}
@@ -95,51 +109,25 @@ def parse_attributes(line):
             attributes[key] = value
     return attributes
 
+def lease_filter(server, attributes):
+    # A reservation without server= applies to all servers; [:nothing] matches only those
+    match_server = 'server=[:nothing]' if server == '' else f'server="{server}"'
+    mac = attributes.get('mac-address')
+    match_mac = f' mac-address={mac}' if mac else ''
+    return f'[find where {match_server} address={attributes["address"]}{match_mac} dynamic=no]'
+
 def sync_reservations(master_reservations, slave_host, client):
     slave_reservations = get_dhcp_reservations(client)
 
     logger.debug(f"Reservations for {slave_host}:\n{json.dumps(slave_reservations, indent=4)}")
 
-    for server, master_server_reservations in master_reservations.items():
-        if server in slave_reservations or server == "":
-            slave_server_reservations = slave_reservations[server] if server in slave_reservations else {}
-
-            match_server = '' if server == '' else f'server="{server}"'
-
-            for ip, master_res in master_server_reservations.items():
-                master_mac = master_res["attributes"]["mac-address"]
-
-                conflict_ip = next(
-                    (slave_ip for slave_ip, slave_res in slave_server_reservations.items()
-                     if slave_res["attributes"]["mac-address"] == master_mac),
-                    None
-                )
-
-                if ip not in slave_server_reservations:
-                    if conflict_ip:
-                        logger.warning(
-                            f"Conflict found for MAC {master_mac} on {slave_host}: "
-                            f"slave has IP {conflict_ip}, master has IP {ip}. Removing conflicting reservation."
-                        )
-                        remove_command = f'/ip dhcp-server lease remove [find {match_server} mac-address={master_mac}]'
-                        ssh_command(client, remove_command)
-                    logger.info(f"Adding reservation on {slave_host} for server {server} and IP {ip}: {master_res['raw']}")
-                    add_command = f'/ip dhcp-server lease add ' + master_res["raw"]
-                    ssh_command(client, add_command)
-                else:
-                    if master_res["raw"] != slave_server_reservations[ip]["raw"]:
-                        if conflict_ip:
-                            logger.warning(
-                                f"Conflict found for MAC {master_mac} on {slave_host}: "
-                                f"slave has IP {conflict_ip}, master has IP {ip}. Removing conflicting reservation."
-                            )
-                            remove_command = f'/ip dhcp-server lease remove [find {match_server} mac-address={master_mac}]'
-                            ssh_command(client, remove_command)
-                        logger.info(f"Replacing reservation on {slave_host} for server {server} and IP {ip}: {master_res['raw']}")
-                        remove_command = f'/ip dhcp-server lease remove [find {match_server} address={ip}]'
-                        ssh_command(client, remove_command)
-                        add_command = f'/ip dhcp-server lease add ' + master_res["raw"]
-                        ssh_command(client, add_command)
+    # Reservations without server= are synced even when the master has none, so stale ones get removed
+    servers = [""]
+    for server in master_reservations:
+        if server == "":
+            continue
+        if server in slave_reservations:
+            servers.append(server)
         else:
             logger.debug(f"Server {server} not found on {slave_host}. Skipping synchronization.")
 
@@ -147,6 +135,23 @@ def sync_reservations(master_reservations, slave_host, client):
                 missing_servers[slave_host] = []
 
             missing_servers[slave_host].append(server)
+
+    wanted = {(server, ip): res for server in servers for ip, res in master_reservations.get(server, {}).items()}
+    current = {(server, ip): res for server in servers for ip, res in slave_reservations.get(server, {}).items()}
+
+    # Remove first: RouterOS refuses a reservation for a MAC that still has one on the slave,
+    # even under another server (e.g. server=lan on the slave, no server on the master)
+    for (server, ip), slave_res in current.items():
+        master_res = wanted.get((server, ip))
+        if master_res is None or master_res["raw"] != slave_res["raw"]:
+            logger.info(f"Removing reservation on {slave_host} for server {server} and IP {ip}: {slave_res['raw']}")
+            ssh_change(client, slave_host, '/ip dhcp-server lease remove ' + lease_filter(server, slave_res["attributes"]))
+
+    for (server, ip), master_res in wanted.items():
+        slave_res = current.get((server, ip))
+        if slave_res is None or slave_res["raw"] != master_res["raw"]:
+            logger.info(f"Adding reservation on {slave_host} for server {server} and IP {ip}: {master_res['raw']}")
+            ssh_change(client, slave_host, '/ip dhcp-server lease add ' + master_res["raw"])
 
 def sync_watchyourlan(master_reservations, wyl_config):
     wyl_url = wyl_config.get('url')
@@ -251,9 +256,10 @@ def main():
                                 master_router.get('password'), master_router.get('key_file'))
 
     master_reservations = get_dhcp_reservations(master_client)
-    logger.debug("Reservations for {master_router['host']}:\n%s", json.dumps(master_reservations, indent=4))
+    logger.debug(f"Reservations for {master_router['host']}:\n%s", json.dumps(master_reservations, indent=4))
 
-    if not master_reservations:
+    # Slaves are made to match the master, so an empty read would wipe them
+    if not any(master_reservations.values()):
         handle_error("No reservations found on the master router.")
 
     for slave_router in config.get("slaves", []):
@@ -266,6 +272,10 @@ def main():
 
     master_client.close()
 
+
+    if failed_commands:
+        logger.error(f"{len(failed_commands)} command(s) failed on slaves, see errors above.")
+        sys.exit(1)
 
     if missing_servers:
         for slave, servers in missing_servers.items():
