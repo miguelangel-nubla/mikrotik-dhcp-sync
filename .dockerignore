@@ -1,0 +1,9 @@
+.git
+.github
+tests
+__pycache__
+**/__pycache__
+requirements-dev.txt
+*.config.yaml
+!example.config.yaml
+config.yaml
