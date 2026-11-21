@@ -16,10 +16,20 @@ logger = logging.getLogger()
 
 dry_run = os.getenv('DRY_RUN', '').lower() in ('1', 'true', 'yes')
 
+# Exit codes. 1 = fatal, the run stopped. Non-fatal problems are bit flags, so one run can report several
+# (e.g. 6 = servers missing on a slave + a slave rejected changes); every step still runs.
+EXIT_FATAL = 1
+EXIT_MISSING_SERVERS = 2
+EXIT_SLAVE_REJECTED = 4
+EXIT_WATCHYOURLAN_FAILED = 8
+
+HTTP_TIMEOUT = 10
+
 missing_servers = {}
 failed_commands = []
+wyl_failures = []
 
-def handle_error(message, exit_code=1):
+def handle_error(message, exit_code=EXIT_FATAL):
     logger.error(message)
     sys.exit(exit_code)
 
@@ -101,7 +111,8 @@ def get_dhcp_reservations(client, command='/ip dhcp-server export terse'):
 
 def parse_attributes(line):
     attributes = {}
-    tokens = re.findall(r'(\S+="[^"]*"|\S+)', line)
+    # A quoted value can contain escaped quotes (comment="a \"b\" c"), so skip over backslash pairs
+    tokens = re.findall(r'(\S+?="(?:[^"\\]|\\.)*"|\S+)', line)
     for token in tokens:
         if '=' in token:
             key, value = token.split('=', 1)
@@ -161,13 +172,17 @@ def sync_watchyourlan(master_reservations, wyl_config):
 
     logger.info(f"Syncing to WatchYourLAN at {wyl_url}...")
 
+    def wyl_get(url):
+        response = requests.get(url, timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        return response
+
     try:
         # Fetch all hosts from WatchYourLAN
-        response = requests.get(f"{wyl_url}/api/all")
-        response.raise_for_status()
-        wyl_hosts = response.json()
+        wyl_hosts = wyl_get(f"{wyl_url}/api/all").json()
     except Exception as e:
-        logger.error(f"Failed to fetch hosts from WatchYourLAN: {e}")
+        logger.error(f"Failed to fetch hosts from WatchYourLAN at {wyl_url}: {e}")
+        wyl_failures.append((wyl_url, "fetch hosts"))
         return
 
     # Map MAC to Wyl Host
@@ -210,18 +225,19 @@ def sync_watchyourlan(master_reservations, wyl_config):
                     if current_name != name:
                         # Call WITHOUT /toggle to just update name/id
                         update_url = f"{wyl_url}/api/edit/{wyl_id}/{enc_name}" 
-                        requests.get(update_url)
+                        wyl_get(update_url)
                         logger.debug(f"Updated WatchYourLAN host {mac} name to '{name}'")
                     
                     # Step 2: Ensure Known=True
                     if not current_known:
                         # Toggle to True
                         toggle_url = f"{wyl_url}/api/edit/{wyl_id}/{enc_name}/toggle"
-                        requests.get(toggle_url)
+                        wyl_get(toggle_url)
                         logger.info(f"Updated WatchYourLAN host {mac}: Set Known=True")
                         
                 except Exception as e:
                     logger.error(f"Failed to update WatchYourLAN host {mac}: {e}")
+                    wyl_failures.append((wyl_url, mac))
 
     # Unmark known for hosts not in master
     for wyl_host in wyl_hosts:
@@ -241,10 +257,11 @@ def sync_watchyourlan(master_reservations, wyl_config):
                     # Current=True. Target=False.
                     # One call toggles to False.
                     edit_url = f"{wyl_url}/api/edit/{wyl_id}/{enc_name}/toggle"
-                    requests.get(edit_url)
+                    wyl_get(edit_url)
                     logger.info(f"Unmarked known flag for WatchYourLAN host {mac} (not in master)")
                 except Exception as e:
                     logger.error(f"Failed to unmark WatchYourLAN host {mac}: {e}")
+                    wyl_failures.append((wyl_url, mac))
 
 def main():
     config_file = os.path.join(config_dir, "config.yaml")
@@ -272,17 +289,6 @@ def main():
 
     master_client.close()
 
-
-    if failed_commands:
-        logger.error(f"{len(failed_commands)} command(s) failed on slaves, see errors above.")
-        sys.exit(1)
-
-    if missing_servers:
-        for slave, servers in missing_servers.items():
-            logger.warning(f"On slave {slave}, the following servers were missing: {', '.join(servers)}.")
-        sys.exit(2)
-
-
     if config.get('watchyourlan'):
         wyl_configs = config.get('watchyourlan')
         if isinstance(wyl_configs, list):
@@ -293,8 +299,23 @@ def main():
              sync_watchyourlan(master_reservations, wyl_configs)
 
 
-    logger.info("Reservation sync completed successfully.")
-    sys.exit(0)
+    exit_code = 0
+    if missing_servers:
+        for slave, servers in missing_servers.items():
+            logger.warning(f"On slave {slave}, the following servers were missing: {', '.join(servers)}.")
+        exit_code |= EXIT_MISSING_SERVERS
+    if failed_commands:
+        logger.error(f"{len(failed_commands)} command(s) failed on slaves, see errors above.")
+        exit_code |= EXIT_SLAVE_REJECTED
+    if wyl_failures:
+        logger.error(f"{len(wyl_failures)} WatchYourLAN operation(s) failed, see errors above.")
+        exit_code |= EXIT_WATCHYOURLAN_FAILED
+
+    if exit_code:
+        logger.error(f"Reservation sync finished with problems (exit code {exit_code}).")
+    else:
+        logger.info("Reservation sync completed successfully.")
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()

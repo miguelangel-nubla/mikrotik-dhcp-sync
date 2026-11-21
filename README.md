@@ -9,12 +9,13 @@ This script synchronizes DHCP reservations from a "Master" Mikrotik router to on
     -   Syncs them to configured slave routers.
     -   Removes leases on slaves that the master doesn't have or that differ from it, including ones that conflict by MAC or by server.
     -   Adds new leases or updates existing ones on slaves.
-    -   Exits non-zero if any change is rejected by a slave.
+    -   Exits non-zero if any change is rejected by a slave (see [Exit codes](#exit-codes)).
 -   **WatchYourLAN Sync**:
     -   Updates host names in WatchYourLAN based on Mikrotik DHCP comments.
     -   Automatically marks hosts as "known" in WatchYourLAN if matched by MAC address.
     -   Unmarks "known" status (sets to unknown) for hosts in WatchYourLAN that are not present in the master router.
     -   Handles multiple WatchYourLAN instances.
+    -   Exits non-zero if WatchYourLAN can't be reached or rejects an update.
 
 ## Prerequisites
 
@@ -49,3 +50,27 @@ docker run --rm \
     ```bash
     -e DRY_RUN=1
     ```
+
+### Exit codes
+
+`1` means a fatal error stopped the run (bad config, SSH failure, no reservations read from the master). Otherwise every step runs, and each kind of problem adds a bit, so one code can report several:
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Everything synced. |
+| `1` | Fatal error, the run stopped. |
+| `2` | A slave lacks a DHCP server the master has; its reservations were skipped there. |
+| `4` | A slave rejected a change. |
+| `8` | A WatchYourLAN fetch or update failed. |
+
+For example `10` = `2 + 8`. Test a bit with `$(( code & 8 ))`.
+
+## Development
+
+The tests replace the routers and WatchYourLAN with fakes, so they need no network:
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest tests
+```
+
